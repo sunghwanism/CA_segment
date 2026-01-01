@@ -1,9 +1,5 @@
 # CA_segment
 
-
-
-
-
 ## Environment Setup
 
 Create environment and install all dependencies via:
