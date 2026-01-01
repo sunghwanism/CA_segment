@@ -1,0 +1,14 @@
+paths:
+  raw_data: 
+  processed_data: 
+  output_dir: 
+  log_dir:
+  env_dir: 
+
+data:
+  class_mapping: 'dataset/class_map.json'
+  
+wandb:
+  project_name:
+  entity_name:
+  run_name:
