@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+config/config.yaml
+TrainScript.sh
 __pycache__/
 *.py[codz]
 *$py.class
