@@ -10,8 +10,9 @@ import ast
 import pandas as pd
 import numpy as np
 import pydicom
-from collections import defaultdict
+from collections import defaultdict, Counter
 
+import plistlib
 from tqdm.auto import tqdm
 
 import yaml
@@ -258,24 +259,117 @@ def extract_metadata_from_DICOM(row):
         return pd.Series({'Status': f'Error: {str(e)}'})
 
 
-def GeneratePatientData(root_dir, saveFileName=None):
-    patient_dicom_dict = get_patient_dicom_dict(os.path.join(cfg.paths.raw_data, 'patient'))
+def verify_dicom_xml_match(df, row_index, dicom_root_dir, slice_offset=0):
+    """
+    Visualizes the overlay. Run this in Notebook or separate check script.
+    """
+    row = df.iloc[row_index]
+    
+    if not row['HasAnnotation'] or not row['LabelPath']:
+        print(f"Row {row_index} (PID: {row['PID']}) has no annotation.")
+        return
 
-    PATIENT_DATAFRAME = pd.DataFrame()
-    for pid in patient_dicom_dict.keys():
-        for patient_dict in patient_dicom_dict[pid]:
-            SID = patient_dict.keys()
-            folder_list = patient_dict.values()
-            row = pd.DataFrame({"PID": [pid], "SID": SID, "FolderList": folder_list})
-            PATIENT_DATAFRAME = pd.concat([PATIENT_DATAFRAME, row], ignore_index=True)
+    with open(row['LabelPath'], 'r') as f:
+        roi_data = json.load(f)
+    
+    annotated_indices = sorted([int(k) for k in roi_data.keys()])
+    if not annotated_indices:
+        print("Empty Annotation Data.")
+        return
 
-    PATIENT_DATAFRAME['PID'] = PATIENT_DATAFRAME['PID'].astype(int)
-    PATIENT_DATAFRAME.sort_values(by='PID', inplace=True)
-    PATIENT_DATAFRAME.reset_index(drop=True, inplace=True)
+    target_instance_num = annotated_indices[len(annotated_indices)//2]
+    series_path = os.path.join(dicom_root_dir, 'patient', str(row['FolderList']))
+    
+    dicom_file = None
+    if os.path.exists(series_path):
+        for f in os.listdir(series_path):
+            if f.endswith('.dcm'):
+                try:
+                    dcm = pydicom.dcmread(os.path.join(series_path, f), stop_before_pixels=True)
+                    if int(dcm.InstanceNumber) == (target_instance_num + slice_offset):
+                        dicom_file = pydicom.dcmread(os.path.join(series_path, f))
+                        break
+                except:
+                    continue
+    
+    if dicom_file is None:
+        print(f"❌ Failed to find DICOM slice {target_instance_num + slice_offset}")
+        return
 
-    meta_df = PATIENT_DATAFRAME.apply(extract_metadata_from_DICOM, axis=1)
-    PATIENT_DATAFRAME = pd.merge(PATIENT_DATAFRAME, meta_df, left_index=True, right_index=True)
+    slope = float(getattr(dicom_file, 'RescaleSlope', 1))
+    intercept = float(getattr(dicom_file, 'RescaleIntercept', 0))
+    image = dicom_file.pixel_array.astype(np.float32) * slope + intercept
+    
+    center, width = 400, 1000
+    img_min = center - width // 2
+    img_max = center + width // 2
+    image = np.clip(image, img_min, img_max)
+    image = (image - img_min) / (img_max - img_min)
 
-    if saveFileName:
-        PATIENT_DATAFRAME.to_csv(os.path.join(cfg.paths.processed_data, saveFileName), index=False)
-    return PATIENT_DATAFRAME
+    H, W = image.shape
+    mask = np.zeros((H, W), dtype=np.uint8)
+    slice_rois = roi_data.get(str(target_instance_num), [])
+    
+    print(f"🔍 Slice {target_instance_num}: {len(slice_rois)} ROIs found.")
+    
+    for roi in slice_rois:
+        pts = np.array(roi['points'], dtype=np.int32)
+        cv2.fillPoly(mask, [pts], color=1)
+
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.title(f"Overlay PID:{row['PID']}")
+    plt.imshow(image, cmap='gray')
+    
+    plt.imshow(mask, cmap='jet', alpha=0.5)
+    plt.axis('off')
+    plt.show()
+
+
+def scan_unique_roi_names(files, verbose=False):
+    """
+    Scans all XML/Plist files in the directory and counts the occurrences of each ROI Name.
+    """
+    
+    # Counter to store Name: Count
+    roi_name_counter = Counter()
+    
+    # Counter for errors
+    error_count = 0
+    
+    for file_path in tqdm(files):
+        
+        try:
+            with open(file_path, 'rb') as f:
+                plist_data = plistlib.load(f)
+            
+            images = plist_data.get('Images', [])
+            
+            for img in images:
+                rois = img.get('ROIs', [])
+                if not rois:
+                    print(f"No ROIs found in {file_path}")
+                    continue
+                
+                for roi in rois:
+                    # Extract Name
+                    raw_name = roi.get('Name')
+                    
+                    if raw_name:
+                        clean_name = raw_name.strip()
+                        roi_name_counter[clean_name] += 1
+                    else:
+                        print(f"No Name Tag found in {file_path}")
+                        roi_name_counter['(No Name Tag)'] += 1
+                        
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
+            error_count += 1
+    
+    if verbose:
+        print("\n" + "="*50)
+        print(f"✅ Scan Complete.")
+        print(f"❌ Failed files: {error_count}")
+        print("="*50)
+    
+    return roi_name_counter
