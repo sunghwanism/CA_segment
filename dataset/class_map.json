@@ -1,0 +1,26 @@
+{
+  "parsing_map": {
+    "Right Coronary Artery": 1,
+    "RCA": 1,
+    "Left Anterior Descending Artery": 2,
+    "LAD": 2,
+    "Left Circumflex Artery": 3,
+    "LCX": 3,
+    "Left Coronary Artery": 4,
+    "LCA": 4,
+    "Unknown": 5
+  },
+  "display_map": {
+    "0": "Background",
+    "1": "RCA",
+    "2": "LAD",
+    "3": "LCX",
+    "4": "LCA",
+    "5": "Unknown"
+  },
+  "metadata": {
+    "description": "Coronary Artery Segmentation Labels",
+    "created_at": "2026-12-31",
+    "version": "1.0"
+  }
+}
