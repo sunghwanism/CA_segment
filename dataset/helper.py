@@ -7,6 +7,7 @@ import json
 
 import re
 import ast
+import cv2
 import pandas as pd
 import numpy as np
 import pydicom
@@ -19,6 +20,7 @@ import yaml
 from box import ConfigBox
 
 from utils.functions import load_config
+
 
 cfg = load_config()
 
@@ -373,3 +375,71 @@ def scan_unique_roi_names(files, verbose=False):
         print("="*50)
     
     return roi_name_counter
+
+def get_image_and_mask(dcm_filePath, LabelPath, slice_offset=0):
+    """
+    Loads a specific DICOM file and its corresponding annotation from a patient's JSON label file.
+    Returns the Hounsfield Unit (HU) converted image and a binary segmentation mask.
+
+    Args:
+        dcm_filePath (str): Absolute path to the single .dcm file.
+        LabelPath (str): Absolute path to the preprocessed .json label file for the patient.
+        slice_offset (int): Offset to align DICOM InstanceNumber with XML ImageIndex.
+                            (Default is 0, adjust if there is a mismatch).
+
+    Returns:
+        image_hu (np.array): The CT image converted to Hounsfield Units (dtype=np.float64).
+        mask (np.array): Binary segmentation mask where 1 indicates the ROI (dtype=np.uint8).
+    """
+    
+    # 1. Validation: Check if DICOM file exists
+    if not os.path.exists(dcm_filePath):
+        raise FileNotFoundError(f"DICOM file not found: {dcm_filePath}")
+        
+    # 2. Load DICOM file
+    dcm = pydicom.dcmread(dcm_filePath)
+    
+    # 3. Convert raw pixel data to Hounsfield Units (HU)
+    # Formula: HU = pixel_value * slope + intercept
+    slope = getattr(dcm, 'RescaleSlope', 1.0)
+    intercept = getattr(dcm, 'RescaleIntercept', 0.0)
+    
+    # Use float64 to prevent overflow and maintain precision during calculation
+    image_hu = dcm.pixel_array.astype(np.float64) * slope + intercept
+    
+    # 4. Initialize an empty binary mask
+    # The mask should have the same spatial dimensions (Height, Width) as the image
+    H, W = image_hu.shape
+    mask = np.zeros((H, W), dtype=np.uint8)
+    
+    # 5. Validation: Check if Label file exists
+    if not os.path.exists(LabelPath):
+        # If no label file exists for this patient, return the empty mask
+        # print(f"Warning: Label file not found at {LabelPath}. Returning empty mask.")
+        return image_hu, mask
+        
+    # 6. Load JSON Label Data
+    with open(LabelPath, 'r', encoding='utf-8') as f:
+        roi_data = json.load(f)
+        
+    # 7. Match the DICOM Slice to the JSON Annotation
+    # The 'InstanceNumber' tag in DICOM usually corresponds to the slice index.
+    instance_num = int(dcm.InstanceNumber)
+    
+    # Apply offset if necessary (e.g., if XML index starts at 0 but DICOM starts at 1)
+    target_key = str(instance_num - slice_offset)
+    
+    # 8. Draw ROIs on the Mask
+    if target_key in roi_data:
+        rois = roi_data[target_key]
+        
+        for roi in rois:
+            # Extract points (list of [x, y]) and convert to numpy int32 array
+            # OpenCV requires points to be int32
+            pts = np.array(roi['points'], dtype=np.int32)
+            
+            # Fill the polygon on the mask
+            # color=1: Assigns value 1 to the ROI area (Foreground)
+            cv2.fillPoly(mask, [pts], color=1)
+            
+    return image_hu, mask

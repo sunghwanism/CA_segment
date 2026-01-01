@@ -10,13 +10,15 @@ import pydicom
 import plistlib
 import cv2
 import matplotlib.pyplot as plt
+from skimage.measure import label, regionprops
 from tqdm import tqdm
 
 # Configuration Settings
 pydicom.config.settings.reading_validation_mode = pydicom.config.IGNORE
 
 from utils.functions import load_config
-from dataset.helper import get_patient_dicom_dict, extract_metadata_from_DICOM
+from dataset.helper import get_patient_dicom_dict, extract_metadata_from_DICOM, get_image_and_mask
+
 
 # Load config
 cfg = load_config()
@@ -123,8 +125,8 @@ def parse_and_save_annotation(pid, xml_path, save_dir, class_map):
                     y = int(round(float(matches[1])))
                     parsed_polygon.append([x, y])
             
-            # Double check valid polygon formation (min 3 points)
-            if len(parsed_polygon) > 2:
+            # Double check valid polygon formation (min 2 points)
+            if len(parsed_polygon) > 1:
                 valid_rois.append({
                     "class_id": class_id,
                     "class_name": raw_name, # Keep for debugging/verification
@@ -185,20 +187,20 @@ def GeneratePatientData(root_dir):
     return PATIENT_DATAFRAME
 
 def main(args):
-    # Step 1: DICOM DataFrame
+    # Step 1: Generate Metadata DataFrame
     patient_df = GeneratePatientData(args.root_dir)
 
-    # Step 2: Processing XML Annotations
-    print("\n>>> [3/3] Processing XML Annotations...")
-    print(f"🎯 Using Class Mapping from Config: {len(CLASS_MAPPING)} classes loaded.")
+    # Step 2: Process XML Annotations & Calculate Scores
+    print("\n>>> [3/3] Processing XML Annotations & Calculating Scores...")
     
     XMLBASEPATH = os.path.join(cfg.paths.raw_data, 'calcium_xml')
     PROCESSED_LABEL_DIR = os.path.join(cfg.paths.processed_data, 'labels_json')
     
+    # Initialize new columns
     patient_df['HasAnnotation'] = False
     patient_df['LabelPath'] = None
     patient_df['TargetClasses'] = None
-    patient_df['NumAnnotatedSlices'] = 0
+    patient_df['Calculated_Score'] = 0.0  # <--- New Column for Agatston Score
     
     unique_pids = patient_df['PID'].unique()
     
@@ -209,34 +211,159 @@ def main(args):
              xml_path = os.path.join(XMLBASEPATH, f"{pid}.plist")
 
         if os.path.exists(xml_path):
-            # 2. Parse & Save JSON (Using loaded CLASS_MAPPING)
+            # 2. Parse & Save JSON (Using existing logic)
             meta_info = parse_and_save_annotation(
                 pid, 
                 xml_path, 
                 PROCESSED_LABEL_DIR, 
-                CLASS_MAPPING # Pass the config map here
+                CLASS_MAPPING
             )
             
             if meta_info and meta_info['HasAnnotation']:
-                # 3. Link to DataFrame
-                mask = patient_df['PID'] == pid
-                patient_df.loc[mask, 'HasAnnotation'] = True
-                patient_df.loc[mask, 'LabelPath'] = meta_info['LabelPath']
-                patient_df.loc[mask, 'NumAnnotatedSlices'] = meta_info['NumAnnotatedSlices']
+                # Update DataFrame flags
+                mask_indices = patient_df['PID'] == pid
+                patient_df.loc[mask_indices, 'HasAnnotation'] = True
+                patient_df.loc[mask_indices, 'LabelPath'] = meta_info['LabelPath']
                 
-                # Store class usage info
+                # Store class information
                 classes_str = str(meta_info['TargetClasses'])
-                for idx in patient_df[mask].index:
+                for idx in patient_df[mask_indices].index:
                     patient_df.at[idx, 'TargetClasses'] = classes_str
+                
+                # --- [NEW] Calculate Agatston Score ---
+                # Call the scoring function
+                score, _ = compute_agatston_score_and_mask(
+                    json_path=meta_info['LabelPath'], 
+                    dicom_folder=patient_df[patient_df['PID'] == pid]['FolderList'].values[0]
+                )
+                
+                # Assign the calculated score to all rows for this PID
+                patient_df.loc[mask_indices, 'Calculated_Score'] = score
 
     # Final Save
     save_path = os.path.join(cfg.paths.processed_data, args.saveFileName)
     patient_df.to_csv(save_path, index=False)
-    print(f"\n✅ Pipeline Complete. Saved to {save_path}")
-    print(f"Total Annotated Entries: {patient_df['HasAnnotation'].sum()}")
     
-    # Validation Hint
-    print("\n[Action Required] Verify SID alignments using 'verify_dicom_xml_match' function.")
+    print(f"\n✅ Pipeline Complete.")
+    print(f"Saved to: {save_path}")
+    
+    # Check sample scores
+    annotated_rows = patient_df[patient_df['HasAnnotation']]
+    if not annotated_rows.empty:
+        print("\n[Sample Agatston Scores]")
+        print(annotated_rows[['PID', 'Calculated_Score']].drop_duplicates().head())
+
+
+def get_dicom_file_map(dicom_folder):
+    """
+    Scans the DICOM folder to create a {InstanceNumber: FilePath} mapping.
+    Purpose: To find the DICOM file corresponding to the XML ImageIndex in O(1) time.
+    """
+    mapping = {}
+
+    if dicom_folder is None:
+        return mapping
+
+    for f in dicom_folder:
+        if f.endswith('.dcm'):
+            path = os.path.join(cfg.paths.raw_data, f)
+            try:
+                # Read header only (stop_before_pixels=True) for speed
+                dcm = pydicom.dcmread(path, stop_before_pixels=True)
+                idx = int(dcm.InstanceNumber)
+                mapping[idx] = path
+            except:
+                continue
+    return mapping
+
+def compute_agatston_score_and_mask(json_path, dicom_folder, slice_offset=0):
+    """
+    Combines the saved JSON label and original DICOM to:
+    1. Generate a 2D/3D Segmentation Mask (Using get_image_and_mask helper).
+    2. Precisely calculate the Agatston Score (Calcium Score).
+    
+    Args:
+        json_path (str): Path to the preprocessed JSON label file.
+        dicom_folder (str): Path to the patient's DICOM folder.
+        slice_offset (int): Offset between XML Index and DICOM Instance Number.
+        
+    Returns:
+        total_score (float): The patient's total Agatston Score.
+        mask_volume (dict): Mask data in format {slice_idx: 2d_numpy_array}.
+    """
+    
+    # 1. Load JSON to get the list of annotated slices
+    with open(json_path, 'r', encoding='utf-8') as f:
+        roi_data = json.load(f)
+
+    # 2. Map DICOM files for quick lookup
+    dcm_map = get_dicom_file_map(dicom_folder)
+    
+    assert len(dcm_map) > 0, "No DICOM files found in the folder."
+    
+    total_score = 0.0
+    mask_volume = {}
+    
+    # 3. Iterate only through slices with annotations
+    for slice_idx_str in roi_data.keys():
+        slice_idx = int(slice_idx_str)
+        target_instance = slice_idx + slice_offset
+        
+        dcm_path = dcm_map.get(target_instance)
+        if not dcm_path:
+            continue
+
+        # --- [Step A] Use Helper Function (Replacement) ---
+        # This single line replaces DICOM loading, HU conversion, and Mask generation.
+        try:
+            image_hu, mask = get_image_and_mask(dcm_path, json_path, slice_offset)
+        except Exception as e:
+            print(f"Error processing slice {slice_idx}: {e}")
+            continue
+
+        mask_volume[slice_idx] = mask
+
+        # --- [Step B] Get Metadata for Scoring (Extra Step) ---
+        # Since get_image_and_mask returns numpy arrays only, 
+        # we need to read the header again to get PixelSpacing.
+        # 'stop_before_pixels=True' makes this very fast.
+        dcm_meta = pydicom.dcmread(dcm_path, stop_before_pixels=True)
+        
+        try:
+            # Area = spacing_x * spacing_y
+            area_per_pixel = float(dcm_meta.PixelSpacing[0]) * float(dcm_meta.PixelSpacing[1])
+        except (AttributeError, TypeError):
+            area_per_pixel = 0.5 * 0.5 # Default fallback
+
+        # --- [Step C] Calculate Agatston Score (Same Logic) ---
+        # 1. Filter: Intersection of Mask AND High Intensity (>130 HU)
+        calcium_candidates = np.zeros_like(mask)
+        calcium_candidates[(mask > 0) & (image_hu >= 130)] = 1
+        
+        # 2. Connected Component Analysis
+        labeled_blobs = label(calcium_candidates) 
+        blob_props = regionprops(labeled_blobs, intensity_image=image_hu)
+        
+        slice_score = 0.0
+        
+        for blob in blob_props:
+            # Measure Max HU within the blob
+            max_hu = blob.max_intensity
+            
+            # Apply Agatston Weighting Rule
+            if max_hu >= 400: weight = 4
+            elif max_hu >= 300: weight = 3
+            elif max_hu >= 200: weight = 2
+            elif max_hu >= 130: weight = 1
+            else: weight = 0
+            
+            # Score = Area(mm2) * Weight
+            slice_score += (blob.area * area_per_pixel * weight)
+            
+        total_score += slice_score
+
+    return total_score, mask_volume
+
 
 if __name__ == '__main__':
     arg = get_argparser()

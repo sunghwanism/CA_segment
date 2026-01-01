@@ -24,3 +24,5 @@ def load_scan(FileList):
     slices = [pydicom.dcmread(cfg.paths.raw_data + s) for s in FileList]
     
     return slices
+
+
